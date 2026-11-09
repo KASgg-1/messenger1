@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Мессенджер</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #eef1f5; height: 100vh; }
+  .hidden { display: none !important; }
+  #auth { max-width: 360px; margin: 80px auto; background: #fff; padding: 24px; border-radius: 12px; box-shadow: 0 2px 10px #0001; }
+  #auth input { width: 100%; padding: 10px; margin: 6px 0; border: 1px solid #ccc; border-radius: 8px; }
+  button { padding: 10px 14px; border: 0; border-radius: 8px; background: #3b82f6; color: #fff; cursor: pointer; margin-top: 4px; }
+  button.alt { background: #64748b; }
+  #app { display: flex; height: 100vh; }
+  #side { width: 300px; background: #fff; border-right: 1px solid #ddd; display: flex; flex-direction: column; padding: 12px; gap: 6px; overflow: auto; }
+  #side input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 8px; margin-top: 4px; }
+  .chat { padding: 10px; border-radius: 8px; cursor: pointer; }
+  .chat:hover, .chat.active { background: #e0ecff; }
+  #main { flex: 1; display: flex; flex-direction: column; }
+  #head { padding: 14px; background: #fff; border-bottom: 1px solid #ddd; font-weight: 600; }
+  #msgs { flex: 1; overflow: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 65%; padding: 8px 12px; border-radius: 12px; background: #fff; box-shadow: 0 1px 2px #0001; }
+  .msg.mine { align-self: flex-end; background: #dbeafe; }
+  .msg .who { font-size: 12px; color: #475569; margin-bottom: 2px; }
+  .msg .time { font-size: 11px; color: #94a3b8; text-align: right; }
+  #form { display: flex; gap: 8px; padding: 12px; background: #fff; border-top: 1px solid #ddd; }
+  #form input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+  .small { font-size: 13px; color: #64748b; }
+  #err { color: #dc2626; margin-top: 8px; min-height: 18px; }
+</style>
+</head>
+<body>
+
+<div id="auth">
+  <h2>Мессенджер</h2>
+  <input id="name" placeholder="Ваше имя">
+  <input id="uid" placeholder="Ваш ID (нужен только для входа)">
+  <button onclick="register()">Регистрация</button>
+  <button class="alt" onclick="login()">Войти</button>
+  <div id="err"></div>
+</div>
+
+<div id="app" class="hidden">
+  <div id="side">
+    <div>Вы: <b id="me"></b> (ID: <b id="myid"></b>)</div>
+    <div class="small">Назовите этот ID собеседникам, чтобы они могли вам писать.</div>
+    <button class="alt" onclick="logout()">Выйти</button>
+    <hr>
+    <b>Новый личный чат</b>
+    <input id="newId" placeholder="ID собеседника">
+    <button onclick="openDirect()">Открыть чат</button>
+    <hr>
+    <b>Новая группа</b>
+    <input id="gName" placeholder="Название группы">
+    <input id="gMembers" placeholder="ID участников через запятую">
+    <button onclick="createGroup()">Создать группу</button>
+    <hr>
+    <b>Чаты</b>
+    <div id="chats"></div>
+  </div>
+  <div id="main">
+    <div id="head">Выберите чат</div>
+    <div id="msgs"></div>
+    <div id="form" class="hidden">
+      <input id="text" placeholder="Сообщение" onkeydown="if(event.key==='Enter') send()">
+      <button onclick="send()">Отправить</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let me = JSON.parse(localStorage.getItem("me") || "null");
+let ws = null;
+let currentChat = null;
+
+function $(id) { return document.getElementById(id); }
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+async function api(url, opts = {}) {
+  opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+  if (me) opts.headers["X-User-Id"] = me.id;
+  const r = await fetch(url, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Ошибка запроса");
+  return data;
+}
+
+async function register() {
+  try {
+    const u = await api("/api/register", { method: "POST", body: JSON.stringify({ name: $("name").value }) });
+    alert("Ваш ID: " + u.id + "\nЗапомните его: вместе с именем он нужен для входа.");
+    save(u);
+  } catch (e) { $("err").textContent = e.message; }
+}
+
+async function login() {
+  try {
+    const u = await api("/api/login", {
+      method: "POST",
+      body: JSON.stringify({ id: Number($("uid").value), name: $("name").value })
+    });
+    save(u);
+  } catch (e) { $("err").textContent = e.message; }
+}
+
+function save(u) {
+  me = u;
+  localStorage.setItem("me", JSON.stringify(u));
+  start();
+}
+
+function logout() {
+  localStorage.removeItem("me");
+  location.reload();
+}
+
+function start() {
+  $("auth").classList.add("hidden");
+  $("app").classList.remove("hidden");
+  $("me").textContent = me.name;
+  $("myid").textContent = me.id;
+  connect();
+  loadChats();
+}
+
+function connect() {
+  if (ws) { const old = ws; ws = null; old.close(); }
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const sock = new WebSocket(`${proto}://${location.host}/ws/${me.id}`);
+  ws = sock;
+  sock.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === "message") {
+      if (data.message.chat === currentChat) addMessage(data.message);
+      loadChats();
+    } else if (data.type === "refresh") {
+      loadChats();
+    }
+  };
+  // Автоматическое переподключение (например, после того как сервер «проснулся»)
+  sock.onclose = () => { if (ws === sock) setTimeout(connect, 2000); };
+}
+
+async function loadChats() {
+  try {
+    const list = await api("/api/chats");
+    $("chats").innerHTML = "";
+    list.forEach((c) => {
+      const d = document.createElement("div");
+      d.className = "chat" + (c.chat === currentChat ? " active" : "");
+      d.textContent = (c.type === "group" ? "[группа] " : "") + c.title;
+      d.onclick = () => openChat(c.chat, c.title);
+      $("chats").appendChild(d);
+    });
+  } catch (e) { /* пользователь мог выйти */ }
+}
+
+async function openChat(chat, title) {
+  try {
+    const msgs = await api("/api/messages?chat=" + encodeURIComponent(chat));
+    currentChat = chat;
+    $("head").textContent = title;
+    $("form").classList.remove("hidden");
+    $("msgs").innerHTML = "";
+    msgs.forEach(addMessage);
+    loadChats();
+  } catch (e) { alert(e.message); }
+}
+
+function addMessage(m) {
+  const box = document.createElement("div");
+  box.className = "msg" + (m.sender_id === me.id ? " mine" : "");
+  const time = new Date(m.created * 1000).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+  box.innerHTML = `<div class="who">${esc(m.sender_name)} (ID ${m.sender_id})</div>` +
+                  `${esc(m.text)}<div class="time">${time}</div>`;
+  $("msgs").appendChild(box);
+  $("msgs").scrollTop = $("msgs").scrollHeight;
+}
+
+async function send() {
+  const text = $("text").value.trim();
+  if (!text || !currentChat) return;
+  try {
+    await api("/api/messages", { method: "POST", body: JSON.stringify({ chat: currentChat, text }) });
+    $("text").value = "";
+  } catch (e) { alert(e.message); }
+}
+
+async function openDirect() {
+  const id = Number($("newId").value);
+  try {
+    const u = await api("/api/user/" + id);
+    const a = Math.min(me.id, u.id), b = Math.max(me.id, u.id);
+    await openChat(`d:${a}:${b}`, `${u.name} (ID ${u.id})`);
+    $("newId").value = "";
+  } catch (e) { alert(e.message); }
+}
+
+async function createGroup() {
+  const members = $("gMembers").value.split(",").map((s) => Number(s.trim())).filter(Boolean);
+  try {
+    const g = await api("/api/groups", {
+      method: "POST",
+      body: JSON.stringify({ name: $("gName").value, members })
+    });
+    $("gName").value = "";
+    $("gMembers").value = "";
+    await openChat(`g:${g.id}`, g.name);
+  } catch (e) { alert(e.message); }
+}
+
+if (me) start();
+</script>
+</body>
+</html>
